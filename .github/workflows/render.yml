@@ -1,0 +1,212 @@
+name: Render Blender Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      quality:
+        description: "Quality: draft (fast test) / standard (720p) / high (1080p)"
+        required: true
+        default: standard
+        type: choice
+        options:
+          - draft
+          - standard
+          - high
+      zip_name:
+        description: "Zip file name in repo root (blank = newest zip)"
+        required: false
+        default: ""
+        type: string
+      delete_zip_after:
+        description: "Delete the zip from the repo after a successful render"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: blender-render
+  cancel-in-progress: false
+
+env:
+  BLENDER_VERSION: "4.2.3"
+
+jobs:
+  render:
+    name: Render video
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select and unpack the job zip (fresh every run)
+        env:
+          INPUT_ZIP: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rm -rf job output
+          zips=( *.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::No .zip file found in the repository root."
+            exit 1
+          fi
+          ZIP=""
+          if [ -n "${INPUT_ZIP:-}" ]; then
+            if [ -f "$INPUT_ZIP" ]; then
+              ZIP="$INPUT_ZIP"
+            else
+              echo "::error::Zip '$INPUT_ZIP' not found in repo root."
+              exit 1
+            fi
+          else
+            best=-1
+            for z in "${zips[@]}"; do
+              ts=$(git log -1 --format=%ct -- "$z" 2>/dev/null || true)
+              ts=${ts:-0}
+              if [ "$ts" -gt "$best" ]; then best=$ts; ZIP="$z"; fi
+            done
+          fi
+          echo "Using zip: $ZIP"
+          mkdir -p job output/frames
+          unzip -q -o "$ZIP" -d job
+          rm -rf job/__MACOSX
+          MAIN=""
+          while IFS= read -r f; do
+            if [ -z "$MAIN" ] || [ ${#f} -lt ${#MAIN} ]; then MAIN="$f"; fi
+          done < <(find job -type f -name main.py)
+          if [ -z "$MAIN" ]; then
+            echo "::error::main.py not found inside the zip."
+            exit 1
+          fi
+          JOB_DIR=$(cd "$(dirname "$MAIN")" && pwd)
+          echo "Job dir: $JOB_DIR"
+          ls -la "$JOB_DIR"
+
+          FPS=24; NAME="video"; GRAIN=3; VIGNETTE=true; CRF=15
+          CFG="$JOB_DIR/job.json"
+          if [ -f "$CFG" ]; then
+            FPS=$(jq -r '.fps // 24' "$CFG")
+            NAME=$(jq -r '.output_name // "video"' "$CFG")
+            GRAIN=$(jq -r '.grain // 3' "$CFG")
+            CRF=$(jq -r '.crf // 15' "$CFG")
+            VIGNETTE=$(jq -r 'if has("vignette") then .vignette else true end' "$CFG")
+          fi
+          NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9_.-' '_')
+          {
+            echo "JOB_DIR=$JOB_DIR"
+            echo "ZIP_NAME=$ZIP"
+            echo "FPS=$FPS"
+            echo "VIDEO_NAME=$NAME"
+            echo "GRAIN=$GRAIN"
+            echo "CRF=$CRF"
+            echo "VIGNETTE=$VIGNETTE"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache Blender
+        uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Install Blender and system libraries
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ffmpeg jq unzip xz-utils curl ca-certificates \
+            libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libice6 \
+            libegl1 libgl1 libglu1-mesa libxext6 libx11-6 libgomp1
+          if [ ! -x "$HOME/blender/blender" ]; then
+            FILE="blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+            SERIES="Blender${BLENDER_VERSION%.*}"
+            ok=0
+            for BASE in "https://download.blender.org/release" \
+                        "https://mirrors.ocf.berkeley.edu/blender/release" \
+                        "https://mirror.clarkson.edu/blender/release"; do
+              URL="$BASE/$SERIES/$FILE"
+              echo "Trying $URL"
+              if curl -fL --retry 3 --retry-delay 5 -o /tmp/blender.tar.xz "$URL"; then ok=1; break; fi
+            done
+            if [ "$ok" != "1" ]; then
+              echo "::error::Could not download Blender $BLENDER_VERSION"
+              exit 1
+            fi
+            mkdir -p "$HOME/blender"
+            tar -xf /tmp/blender.tar.xz -C "$HOME/blender" --strip-components=1
+          fi
+          "$HOME/blender/blender" --version
+          ldd "$HOME/blender/blender" | grep "not found" || true
+
+      - name: Render frames with Blender
+        env:
+          QUALITY: ${{ inputs.quality }}
+        run: |
+          set -euo pipefail
+          QUALITY="${QUALITY:-standard}"
+          mkdir -p output/frames
+          "$HOME/blender/blender" -b --factory-startup -noaudio --python-exit-code 1 \
+            --python "$JOB_DIR/main.py" -- \
+            --job-dir "$JOB_DIR" --out "$GITHUB_WORKSPACE/output" --quality "$QUALITY" \
+            2>&1 | tee output/blender.log
+
+      - name: Encode MP4 with ffmpeg
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          frames=( output/frames/*.png )
+          if [ ${#frames[@]} -eq 0 ]; then
+            echo "::error::Blender produced no frames. See the render-log artifact."
+            exit 1
+          fi
+          VF=""
+          if [ "$VIGNETTE" = "true" ]; then VF="vignette=PI/6,"; fi
+          if [ "$GRAIN" != "0" ]; then VF="${VF}noise=alls=${GRAIN}:allf=t+u,"; fi
+          VF="${VF}format=yuv420p"
+          ffmpeg -hide_banner -y -framerate "$FPS" -pattern_type glob -i 'output/frames/*.png' \
+            -vf "$VF" -c:v libx264 -preset slow -crf "$CRF" -pix_fmt yuv420p \
+            -movflags +faststart "output/${VIDEO_NAME}.mp4"
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "output/${VIDEO_NAME}.mp4" || echo "?")
+          SIZE=$(du -h "output/${VIDEO_NAME}.mp4" | cut -f1)
+          {
+            echo "### Render finished"
+            echo "- Zip used: \`$ZIP_NAME\`"
+            echo "- Frames: ${#frames[@]}  |  Duration: ${DUR}s  |  Size: ${SIZE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload MP4
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_number }}
+          path: output/*.mp4
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-log-${{ github.run_number }}
+          path: output/blender.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove used zip from repo (optional)
+        if: success() && inputs.delete_zip_after
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f -- "$ZIP_NAME"
+          git commit -m "Clean up: remove rendered job zip ($ZIP_NAME)"
+          git push
+
+      - name: Clean workspace
+        if: always()
+        run: rm -rf job output
